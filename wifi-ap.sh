@@ -400,13 +400,18 @@ nmcli con modify "$CONNECTION_NAME" 802-11-wireless.channel "$CHANNEL"
 
 # Configure IP settings
 echo "Configuring IP settings..."
-nmcli con modify "$CONNECTION_NAME" ipv4.method manual ipv4.address "$IP_ADDRESS"
+nmcli con modify "$CONNECTION_NAME" ipv4.method shared
+nmcli con modify "$CONNECTION_NAME" ipv4.address "$IP_ADDRESS"
 nmcli con modify "$CONNECTION_NAME" ipv6.method disabled
 
 # Configure security settings
 echo "Configuring security settings..."
 nmcli con modify "$CONNECTION_NAME" wifi-sec.key-mgmt wpa-psk
 nmcli con modify "$CONNECTION_NAME" wifi-sec.psk "$PASSWORD"
+nmcli con modify "$CONNECTION_NAME" wifi-sec.proto rsn
+nmcli con modify "$CONNECTION_NAME" wifi-sec.pairwise ccmp
+nmcli con modify "$CONNECTION_NAME" wifi-sec.group ccmp
+nmcli con modify "$CONNECTION_NAME" 802-11-wireless-security.wps-method disabled
 
 # Bring up the connection
 echo "Starting access point..."
