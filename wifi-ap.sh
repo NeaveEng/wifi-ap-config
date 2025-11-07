@@ -20,9 +20,145 @@ check_privileges() {
 # Check privileges first
 check_privileges "$@"
 
+# Function to check if interface supports a specific band
+check_band_support() {
+    local interface=$1
+    local band=$2  # "2.4" or "5"
+    
+    # Get the physical device (phy) for this interface
+    local phy=$(iw dev "$interface" info 2>/dev/null | grep wiphy | awk '{print "phy"$2}')
+    
+    if [ -z "$phy" ]; then
+        echo "Warning: Could not determine physical device for $interface" >&2
+        return 0  # Assume supported if we can't check
+    fi
+    
+    if [ "$band" == "2.4" ]; then
+        # Check for Band 1 (2.4GHz) - look for 2.4GHz frequencies
+        if iw phy "$phy" info 2>/dev/null | grep -q "2[0-9][0-9][0-9] MHz"; then
+            return 0  # Supported
+        else
+            return 1  # Not supported
+        fi
+    elif [ "$band" == "5" ]; then
+        # Check for Band 2 (5GHz) - look for 5GHz frequencies
+        if iw phy "$phy" info 2>/dev/null | grep -q "5[0-9][0-9][0-9] MHz"; then
+            return 0  # Supported
+        else
+            return 1  # Not supported
+        fi
+    fi
+    
+    return 1
+}
+
+# Function to find best channel for given band
+find_best_channel() {
+    local band=$1
+    local interface=$2
+    local exclude_ssid=$3  # Optional: SSID to exclude from scan results
+    
+    echo "Scanning for nearby access points to find best channel..." >&2
+    
+    # Ensure WiFi is on and scan
+    nmcli radio wifi on 2>/dev/null
+    nmcli dev wifi rescan ifname "$interface" 2>/dev/null || true
+    sleep 2
+    
+    # Get all scan results, optionally excluding our own SSID
+    local wifi_list
+    if [ -n "$exclude_ssid" ]; then
+        wifi_list=$(nmcli -f SSID,CHAN dev wifi list ifname "$interface" 2>/dev/null | grep -v "^${exclude_ssid} " | grep -v "^SSID")
+        echo "  (Excluding own AP: $exclude_ssid)" >&2
+    else
+        wifi_list=$(nmcli -f SSID,CHAN dev wifi list ifname "$interface" 2>/dev/null | grep -v "^SSID")
+    fi
+    
+    if [ "$band" == "2.4" ]; then
+        # For 2.4GHz, count APs on each channel (1-11 are most common)
+        local channel_usage=$(echo "$wifi_list" | awk '{print $NF}' | grep -E "^[0-9]+$" | awk '$1 <= 14' | sort -n | uniq -c | sort -k2 -n)
+        
+        # Find least used channel among 1, 6, 11 (non-overlapping channels)
+        local best_channel=6
+        local min_count=999
+        
+        for ch in 1 6 11; do
+            local count=$(echo "$channel_usage" | awk -v ch="$ch" '$2 == ch {print $1}')
+            if [ -z "$count" ]; then
+                count=0
+            fi
+            if [ "$count" -lt "$min_count" ]; then
+                min_count=$count
+                best_channel=$ch
+            fi
+        done
+        
+        echo "  2.4GHz channel usage:" >&2
+        echo "$channel_usage" | head -10 >&2
+        echo "  Recommended channel: $best_channel (least congested among non-overlapping channels 1, 6, 11)" >&2
+        echo "$best_channel"
+        
+    elif [ "$band" == "5" ]; then
+        # For 5GHz, find least used channel
+        local channel_usage=$(echo "$wifi_list" | awk '{print $NF}' | grep -E "^[0-9]+$" | awk '$1 >= 36' | sort -n | uniq -c | sort -k2 -n)
+        
+        local best_channel=36
+        local min_count=999
+        
+        # Check common 5GHz channels
+        for ch in 36 40 44 48 149 153 157 161 165; do
+            local count=$(echo "$channel_usage" | awk -v ch="$ch" '$2 == ch {print $1}')
+            if [ -z "$count" ]; then
+                count=0
+            fi
+            if [ "$count" -lt "$min_count" ]; then
+                min_count=$count
+                best_channel=$ch
+            fi
+        done
+        
+        echo "  5GHz channel usage:" >&2
+        echo "$channel_usage" | head -10 >&2
+        echo "  Recommended channel: $best_channel (least congested)" >&2
+        echo "$best_channel"
+    fi
+}
+
+# Function to check if interface supports a specific band
+check_band_support() {
+    local interface=$1
+    local band=$2
+    
+    # Get the phy device for this interface
+    local phy=$(iw dev "$interface" info 2>/dev/null | grep wiphy | awk '{print "phy" $2}')
+    
+    if [ -z "$phy" ]; then
+        echo "Warning: Could not determine phy device for interface $interface" >&2
+        return 0  # Allow to proceed if we can't determine
+    fi
+    
+    if [ "$band" == "2.4" ]; then
+        # Check for 2.4GHz support (Band 1, around 2.4 GHz frequencies)
+        if iw phy "$phy" info 2>/dev/null | grep -q "Band 1:"; then
+            return 0  # Supported
+        else
+            return 1  # Not supported
+        fi
+    elif [ "$band" == "5" ]; then
+        # Check for 5GHz support (Band 2, around 5 GHz frequencies)
+        if iw phy "$phy" info 2>/dev/null | grep -q "Band 2:"; then
+            return 0  # Supported
+        else
+            return 1  # Not supported
+        fi
+    fi
+    
+    return 1
+}
+
 # Function to display usage information
 show_usage() {
-    echo "Usage: sudo $0 <SSID> <PASSWORD> [INTERFACE] [CHANNEL] [IP_ADDRESS]"
+    echo "Usage: sudo $0 <SSID> <PASSWORD> [INTERFACE] [CHANNEL] [IP_ADDRESS] [BAND]"
     echo ""
     echo "Note: This script requires root privileges (sudo)"
     echo ""
@@ -30,18 +166,29 @@ show_usage() {
     echo "  SSID        - Name of the WiFi access point (required)"
     echo "  PASSWORD    - Password for the access point (required, min 8 characters)"
     echo "  INTERFACE   - WiFi interface to use (optional, default: auto-detect)"
-    echo "  CHANNEL     - WiFi channel (optional, default: 7)"
+    echo "  CHANNEL     - WiFi channel or 'auto' (optional, default: 7 for 2.4GHz, 36 for 5GHz)"
+    echo "                Use 'auto' to scan and select the least congested channel"
     echo "  IP_ADDRESS  - IP address for the access point (optional, default: 192.168.4.1/24)"
+    echo "  BAND        - WiFi band: 2.4 or 5 (optional, default: 2.4)"
     echo ""
     echo "Options:"
-    echo "  --force     - Skip confirmation prompts (for scripted usage)"
-    echo "  --replace   - Automatically replace existing connections"
-    echo "  --reset     - Remove all AP connections and restore client mode"
+    echo "  --force        - Skip confirmation prompts (for scripted usage)"
+    echo "  --replace      - Automatically replace existing connections"
+    echo "  --reset        - Remove all AP connections and restore client mode"
+    echo "  --band=2.4     - Use 2.4GHz band (channels 1-14)"
+    echo "  --band=5       - Use 5GHz band (channels 36-165)"
+    echo "  --update-band=<CONNECTION_NAME> <BAND> [CHANNEL]"
+    echo "                 - Update band/channel of existing AP without recreating it"
+    echo "                   CHANNEL can be a number or 'auto' for automatic selection"
     echo ""
     echo "Examples:"
     echo "  sudo $0 MyJetsonAP mypassword123"
-    echo "  sudo $0 JetsonNetwork secretpass wlan0 11 192.168.10.1/24"
-    echo "  sudo $0 \"My Jetson AP\" \"my secure password\" wlan1 6 --force"
+    echo "  sudo $0 MyAP password123 wlan0 auto                  # Auto-select best channel"
+    echo "  sudo $0 JetsonNetwork secretpass wlan0 36 192.168.10.1/24 5"
+    echo "  sudo $0 \"My Jetson AP\" \"my secure password\" wlan1 auto --band=5"
+    echo "  sudo $0 FastAP password123 wlan0 --band=5"
+    echo "  sudo $0 --update-band PinPoint-AP 5 149    # Switch existing AP to 5GHz"
+    echo "  sudo $0 --update-band PinPoint-AP 2.4      # Switch back to 2.4GHz"
     echo "  sudo $0 --reset                    # Remove all AP configs and restore client mode"
     echo ""
     echo "Alternative: Use the wrapper script that handles sudo automatically:"
@@ -120,8 +267,166 @@ if [[ "$1" == "--reset" ]]; then
     exit 0
 fi
 
-# Check minimum required arguments (unless using --reset)
-if [ $# -lt 2 ] && [[ "$1" != "--reset" ]]; then
+# Check if update-band is requested
+if [[ "$1" == "--update-band" ]]; then
+    if [ $# -lt 3 ]; then
+        echo "Error: --update-band requires CONNECTION_NAME and BAND"
+        echo "Usage: sudo $0 --update-band <CONNECTION_NAME> <BAND> [CHANNEL]"
+        echo "Example: sudo $0 --update-band PinPoint-AP 5 149"
+        exit 1
+    fi
+    
+    UPDATE_CONNECTION="$2"
+    UPDATE_BAND="$3"
+    UPDATE_CHANNEL="$4"
+    
+    echo "=== WiFi Access Point Band Update Mode ==="
+    echo "Connection: $UPDATE_CONNECTION"
+    echo "New Band: ${UPDATE_BAND}GHz"
+    
+    # Check if connection exists
+    if ! nmcli con show "$UPDATE_CONNECTION" >/dev/null 2>&1; then
+        echo "Error: Connection '$UPDATE_CONNECTION' not found"
+        echo ""
+        echo "Available AP connections:"
+        nmcli -t -f NAME,TYPE con show | grep ":802-11-wireless" | cut -d: -f1 | grep -E ".*-AP$|.*AP$" || echo "  None found"
+        exit 1
+    fi
+    
+    # Validate and normalize band
+    if [[ "$UPDATE_BAND" == "2.4" || "$UPDATE_BAND" == "2" || "$UPDATE_BAND" == "bg" ]]; then
+        UPDATE_BAND="2.4"
+        UPDATE_BAND_VALUE="bg"
+        if [ -z "$UPDATE_CHANNEL" ]; then
+            UPDATE_CHANNEL="7"
+        fi
+    elif [[ "$UPDATE_BAND" == "5" || "$UPDATE_BAND" == "a" ]]; then
+        UPDATE_BAND="5"
+        UPDATE_BAND_VALUE="a"
+        if [ -z "$UPDATE_CHANNEL" ]; then
+            UPDATE_CHANNEL="36"
+        fi
+    else
+        echo "Error: Invalid band '$UPDATE_BAND'. Must be 2.4 or 5"
+        exit 1
+    fi
+    
+    # Get interface from connection
+    UPDATE_INTERFACE=$(nmcli -t -f connection.interface-name con show "$UPDATE_CONNECTION" 2>/dev/null | cut -d: -f2)
+    
+    # Check if hardware supports the requested band
+    if ! check_band_support "$UPDATE_INTERFACE" "$UPDATE_BAND"; then
+        echo ""
+        echo "Error: Interface '$UPDATE_INTERFACE' does not support ${UPDATE_BAND}GHz band"
+        echo ""
+        echo "Supported bands for $UPDATE_INTERFACE:"
+        phy=$(iw dev "$UPDATE_INTERFACE" info 2>/dev/null | grep wiphy | awk '{print "phy"$2}')
+        if [ -n "$phy" ]; then
+            if iw phy "$phy" info 2>/dev/null | grep -q "2[0-9][0-9][0-9] MHz"; then
+                echo "  - 2.4GHz"
+            fi
+            if iw phy "$phy" info 2>/dev/null | grep -q "5[0-9][0-9][0-9] MHz"; then
+                echo "  - 5GHz"
+            fi
+        fi
+        exit 1
+    fi
+    
+    # Get SSID from connection to exclude it from scan
+    UPDATE_SSID=$(nmcli -t -f 802-11-wireless.ssid con show "$UPDATE_CONNECTION" 2>/dev/null | cut -d: -f2)
+    
+    # Handle auto channel selection
+    if [[ "$UPDATE_CHANNEL" == "auto" ]]; then
+        echo ""
+        echo "Auto channel selection requested..."
+        UPDATE_CHANNEL=$(find_best_channel "$UPDATE_BAND" "$UPDATE_INTERFACE" "$UPDATE_SSID")
+        echo "Selected channel: $UPDATE_CHANNEL"
+        echo ""
+    fi
+    
+    # Validate channel based on band
+    if ! [[ "$UPDATE_CHANNEL" =~ ^[0-9]+$ ]]; then
+        echo "Error: Channel must be a number or 'auto'"
+        exit 1
+    fi
+    
+    if [ "$UPDATE_BAND" == "2.4" ]; then
+        if [ "$UPDATE_CHANNEL" -lt 1 ] || [ "$UPDATE_CHANNEL" -gt 14 ]; then
+            echo "Error: For 2.4GHz band, channel must be between 1 and 14"
+            exit 1
+        fi
+    elif [ "$UPDATE_BAND" == "5" ]; then
+        VALID_5GHZ_CHANNELS="36 40 44 48 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144 149 153 157 161 165"
+        if ! echo "$VALID_5GHZ_CHANNELS" | grep -q "\b$UPDATE_CHANNEL\b"; then
+            echo "Error: Invalid 5GHz channel. Common valid channels are: 36, 40, 44, 48, 149, 153, 157, 161, 165"
+            exit 1
+        fi
+    fi
+    
+    echo "New Channel: $UPDATE_CHANNEL"
+    echo ""
+    
+    # Get current state - check if connection is active
+    WAS_ACTIVE=""
+    if nmcli -t -f NAME,DEVICE connection show --active | grep -q "^${UPDATE_CONNECTION}:"; then
+        WAS_ACTIVE="yes"
+        echo "Connection is currently active. It will be restarted with new settings."
+    fi
+    
+    echo ""
+    read -p "Update band and channel for '$UPDATE_CONNECTION'? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Update cancelled."
+        exit 0
+    fi
+    
+    # Stop connection if active
+    if [ "$WAS_ACTIVE" == "yes" ]; then
+        echo "Stopping connection..."
+        nmcli con down "$UPDATE_CONNECTION" 2>/dev/null || true
+    fi
+    
+    # Update band and channel together (must be done in one step to avoid conflicts)
+    echo "Updating band to ${UPDATE_BAND}GHz and channel to $UPDATE_CHANNEL..."
+    nmcli con modify "$UPDATE_CONNECTION" \
+        802-11-wireless.band "$UPDATE_BAND_VALUE" \
+        802-11-wireless.channel "$UPDATE_CHANNEL"
+    
+    # Restart if it was active
+    if [ "$WAS_ACTIVE" == "yes" ]; then
+        echo "Restarting connection..."
+        if nmcli con up "$UPDATE_CONNECTION"; then
+            echo ""
+            echo "SUCCESS: Access point band updated!"
+            echo "  Connection: $UPDATE_CONNECTION"
+            echo "  Band: ${UPDATE_BAND}GHz"
+            echo "  Channel: $UPDATE_CHANNEL"
+            echo ""
+            echo "Connection status:"
+            nmcli con show "$UPDATE_CONNECTION" | grep -E "(connection.id|802-11-wireless.ssid|802-11-wireless.band|802-11-wireless.channel)"
+        else
+            echo ""
+            echo "FAILED: Could not restart connection with new settings"
+            echo "The connection settings have been updated but failed to activate."
+            echo "You may need to check if your hardware supports ${UPDATE_BAND}GHz band."
+            exit 1
+        fi
+    else
+        echo ""
+        echo "SUCCESS: Access point band updated!"
+        echo "  Connection: $UPDATE_CONNECTION"
+        echo "  Band: ${UPDATE_BAND}GHz"
+        echo "  Channel: $UPDATE_CHANNEL"
+        echo ""
+        echo "Connection was not active. Start it with:"
+        echo "  sudo nmcli con up \"$UPDATE_CONNECTION\""
+    fi
+    
+    exit 0
+fi
+
+# Check minimum required arguments (unless using --reset or --update-band)
+if [ $# -lt 2 ] && [[ "$1" != "--reset" ]] && [[ "$1" != "--update-band" ]]; then
     echo "Error: Missing required arguments"
     echo ""
     show_usage
@@ -130,6 +435,7 @@ fi
 # Parse options
 FORCE_MODE=""
 REPLACE_MODE=""
+BAND=""
 ARGS=()
 
 for arg in "$@"; do
@@ -139,6 +445,9 @@ for arg in "$@"; do
             ;;
         --replace)
             REPLACE_MODE="yes"
+            ;;
+        --band=*)
+            BAND="${arg#*=}"
             ;;
         -*)
             echo "Error: Unknown option $arg"
@@ -154,8 +463,32 @@ done
 SSID="${ARGS[0]}"
 PASSWORD="${ARGS[1]}"
 INTERFACE="${ARGS[2]}"
-CHANNEL="${ARGS[3]:-7}"
+CHANNEL="${ARGS[3]}"
 IP_ADDRESS="${ARGS[4]:-192.168.4.1/24}"
+BAND="${ARGS[5]:-${BAND}}"
+
+# Set default band to 2.4 if not specified
+if [ -z "$BAND" ]; then
+    BAND="2.4"
+fi
+
+# Validate and normalize band
+if [[ "$BAND" == "2.4" || "$BAND" == "2" || "$BAND" == "bg" ]]; then
+    BAND="2.4"
+    BAND_VALUE="bg"
+    if [ -z "$CHANNEL" ]; then
+        CHANNEL="7"
+    fi
+elif [[ "$BAND" == "5" || "$BAND" == "a" ]]; then
+    BAND="5"
+    BAND_VALUE="a"
+    if [ -z "$CHANNEL" ]; then
+        CHANNEL="36"
+    fi
+else
+    echo "Error: Invalid band '$BAND'. Must be 2.4 or 5"
+    exit 1
+fi
 
 # Auto-detect WiFi interface if not specified
 if [ -z "$INTERFACE" ]; then
@@ -230,6 +563,26 @@ if echo "$INTERFACE" | grep -q "p2p"; then
     exit 1
 fi
 
+# Check if hardware supports the requested band
+if ! check_band_support "$INTERFACE" "$BAND"; then
+    echo ""
+    echo "Error: Interface '$INTERFACE' does not support ${BAND}GHz band"
+    echo ""
+    echo "Supported bands for $INTERFACE:"
+    phy=$(iw dev "$INTERFACE" info 2>/dev/null | grep wiphy | awk '{print "phy"$2}')
+    if [ -n "$phy" ]; then
+        if iw phy "$phy" info 2>/dev/null | grep -q "2[0-9][0-9][0-9] MHz"; then
+            echo "  - 2.4GHz"
+        fi
+        if iw phy "$phy" info 2>/dev/null | grep -q "5[0-9][0-9][0-9] MHz"; then
+            echo "  - 5GHz"
+        fi
+    fi
+    echo ""
+    echo "Please specify a supported band with --band=2.4 or --band=5"
+    exit 1
+fi
+
 # Check if interface is busy
 INTERFACE_STATE=$(nmcli dev status | grep "^$INTERFACE" | awk '{print $3}')
 if [ "$INTERFACE_STATE" = "connected" ]; then
@@ -269,10 +622,34 @@ if [ ${#PASSWORD} -gt 63 ]; then
     exit 1
 fi
 
-# Validate channel (1-14 for 2.4GHz)
-if ! [[ "$CHANNEL" =~ ^[0-9]+$ ]] || [ "$CHANNEL" -lt 1 ] || [ "$CHANNEL" -gt 14 ]; then
-    echo "Error: Channel must be a number between 1 and 14"
+# Handle auto channel selection
+if [[ "$CHANNEL" == "auto" ]]; then
+    echo ""
+    echo "Auto channel selection requested..."
+    CHANNEL=$(find_best_channel "$BAND" "$INTERFACE" "$SSID")
+    echo "Selected channel: $CHANNEL"
+    echo ""
+fi
+
+# Validate channel based on band
+if ! [[ "$CHANNEL" =~ ^[0-9]+$ ]]; then
+    echo "Error: Channel must be a number or 'auto'"
     exit 1
+fi
+
+if [ "$BAND" == "2.4" ]; then
+    if [ "$CHANNEL" -lt 1 ] || [ "$CHANNEL" -gt 14 ]; then
+        echo "Error: For 2.4GHz band, channel must be between 1 and 14"
+        exit 1
+    fi
+elif [ "$BAND" == "5" ]; then
+    # Valid 5GHz channels: 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165
+    VALID_5GHZ_CHANNELS="36 40 44 48 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144 149 153 157 161 165"
+    if ! echo "$VALID_5GHZ_CHANNELS" | grep -q "\b$CHANNEL\b"; then
+        echo "Error: Invalid 5GHz channel. Common valid channels are: 36, 40, 44, 48, 149, 153, 157, 161, 165"
+        echo "Full list: $VALID_5GHZ_CHANNELS"
+        exit 1
+    fi
 fi
 
 # Generate connection name based on SSID (replace spaces with underscores)
@@ -285,6 +662,7 @@ echo "=== WiFi Access Point Configuration ==="
 echo "SSID: $SSID"
 echo "Password: $PASSWORD"
 echo "Interface: $INTERFACE"
+echo "Band: ${BAND}GHz"
 echo "Channel: $CHANNEL"
 echo "IP Address: $IP_ADDRESS"
 echo "Connection Name: $CONNECTION_NAME"
@@ -294,8 +672,12 @@ echo ""
 CONNECTION_EXISTS=""
 if nmcli con show "$CONNECTION_NAME" >/dev/null 2>&1; then
     CONNECTION_EXISTS="yes"
-    CURRENT_STATE=$(nmcli -t -f STATE con show "$CONNECTION_NAME")
-    echo "STATUS: Connection '$CONNECTION_NAME' already exists (State: $CURRENT_STATE)"
+    # Check if connection is active
+    if nmcli -t -f NAME,DEVICE connection show --active | grep -q "^${CONNECTION_NAME}:"; then
+        echo "STATUS: Connection '$CONNECTION_NAME' already exists (State: active)"
+    else
+        echo "STATUS: Connection '$CONNECTION_NAME' already exists (State: inactive)"
+    fi
 else
     echo "STATUS: Will create new connection '$CONNECTION_NAME'"
 fi
@@ -327,8 +709,7 @@ if nmcli con show "$CONNECTION_NAME" >/dev/null 2>&1; then
     echo "Connection '$CONNECTION_NAME' already exists"
     
     # Check if it's currently active
-    CURRENT_STATE=$(nmcli -t -f STATE con show "$CONNECTION_NAME")
-    if [ "$CURRENT_STATE" = "activated" ]; then
+    if nmcli -t -f NAME,DEVICE connection show --active | grep -q "^${CONNECTION_NAME}:"; then
         echo "Connection is currently active. It will be stopped and reconfigured."
         nmcli con down "$CONNECTION_NAME" 2>/dev/null || true
     fi
@@ -395,7 +776,7 @@ fi
 
 # Configure wireless settings
 echo "Configuring wireless settings..."
-nmcli con modify "$CONNECTION_NAME" 802-11-wireless.band bg
+nmcli con modify "$CONNECTION_NAME" 802-11-wireless.band "$BAND_VALUE"
 nmcli con modify "$CONNECTION_NAME" 802-11-wireless.channel "$CHANNEL"
 
 # Configure IP settings
@@ -420,6 +801,7 @@ if nmcli con up "$CONNECTION_NAME"; then
     echo "SUCCESS: WiFi Access Point successfully created!"
     echo "  SSID: $SSID"
     echo "  Interface: $INTERFACE"
+    echo "  Band: ${BAND}GHz"
     echo "  Password: $PASSWORD"
     echo "  Channel: $CHANNEL"
     echo "  IP Address: $IP_ADDRESS"
@@ -429,7 +811,7 @@ if nmcli con up "$CONNECTION_NAME"; then
     
     # Show connection status
     echo "Connection status:"
-    nmcli con show "$CONNECTION_NAME" | grep -E "(connection.id|connection.interface-name|802-11-wireless.ssid|802-11-wireless.channel|ipv4.addresses)"
+    nmcli con show "$CONNECTION_NAME" | grep -E "(connection.id|connection.interface-name|802-11-wireless.ssid|802-11-wireless.band|802-11-wireless.channel|ipv4.addresses)"
 else
     echo "FAILED: Failed to start access point"
     echo "You may need to check if the wireless interface supports AP mode or if there are conflicting connections."
