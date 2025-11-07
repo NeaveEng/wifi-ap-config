@@ -1,6 +1,6 @@
-# WiFi Access Point Scripts for Jetson Orin Nano
+# WiFi Access Point Scripts for Linux Devices
 
-A collection of scripts to easily set up, manage, and reset WiFi access points on NVIDIA Jetson Orin Nano devices.
+A collection of scripts to easily set up, manage, and reset WiFi access points on Linux devices. Only tested on Jetson Orin Nano but should work on any machine running Network Manager.
 
 ## 📋 Overview
 
